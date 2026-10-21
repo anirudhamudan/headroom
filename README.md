@@ -8,6 +8,8 @@ Claude usage limits in your Mac menu bar.
 
 Headroom shows your current 5-hour session usage at a glance. Click it to see your weekly limits and when each one resets. A small dot appears next to the percentage when any limit is getting close.
 
+![Headroom showing 82% session usage in the menu bar, with the usage panel open](Assets/screenshot.png)
+
 > **Unofficial.** Headroom is an independent project. It is not made by, affiliated with, or endorsed by Anthropic. "Claude" is a trademark of Anthropic.
 
 ## Before you start
@@ -61,6 +63,13 @@ open /Applications/Headroom.app
 ```
 
 `./build.sh --release` builds a universal (Apple silicon + Intel) app and zips it to `build/Headroom.zip`.
+
+For screenshots, demo mode shows fixed sample numbers instead of your real usage. Quit and reopen Headroom after changing it:
+
+```bash
+defaults write app.headroom.menubar demo -bool true   # on
+defaults delete app.headroom.menubar demo             # off
+```
 
 ## License
 

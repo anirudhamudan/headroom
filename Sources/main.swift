@@ -359,6 +359,21 @@ final class UsageStore: ObservableObject {
             return
         }
 
+        // Demo mode for screenshots: `defaults write app.headroom.menubar demo -bool true`.
+        if UserDefaults.standard.bool(forKey: "demo") {
+            let now = Date()
+            plan = "pro"
+            limits = [
+                Limit(id: "five_hour", label: labels["five_hour"]!, utilization: 82,
+                      resetsAt: now.addingTimeInterval(72 * 60), severity: .warning),
+                Limit(id: "seven_day", label: labels["seven_day"]!, utilization: 47,
+                      resetsAt: now.addingTimeInterval(3 * 86400 + 5 * 3600), severity: .normal),
+            ]
+            error = nil
+            lastUpdated = now
+            return
+        }
+
         loading = true
         defer { loading = false }
         do {
