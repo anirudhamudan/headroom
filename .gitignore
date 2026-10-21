@@ -1,0 +1,10 @@
+# Build output
+build/
+*.zip
+*.dmg
+
+# Generated during icon builds
+Assets/AppIcon.iconset/
+
+# macOS
+.DS_Store
