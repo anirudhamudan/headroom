@@ -14,13 +14,24 @@ Headroom shows your current 5-hour session usage at a glance. Click it to see yo
 
 ## Before you start
 
-Headroom reads your usage through **[Claude Code](https://docs.claude.com/en/docs/claude-code)**, so you need:
+Headroom reads your usage through the **[Claude Code](https://docs.claude.com/en/docs/claude-code) command-line tool**, so you need:
 
 - A Mac running macOS 13 (Ventura) or later
 - A Claude subscription (Pro, Max, Team, or Enterprise)
-- Claude Code installed and signed in. If you've never used it, open Terminal and run `claude`, then follow the sign-in steps.
+- The Claude Code command-line tool, signed in once (setup below)
 
-If you only use Claude in the browser or the Claude desktop app, Headroom won't be able to see your usage yet.
+> **Using Claude Code inside the Claude Mac app doesn't count.** The app keeps its own sign-in, which Headroom can't read. You need the command-line tool as well. It's a one-time, two-minute setup, and Headroom walks you through it if it's missing.
+
+### One-time setup
+
+1. Open **Terminal** and install the command-line tool:
+   ```bash
+   curl -fsSL https://claude.ai/install.sh | bash
+   ```
+2. Run `claude`, type `/login`, and choose your Claude subscription account.
+3. Type `/exit`. In Headroom, click **Renew automatically** so you never need Terminal again.
+
+Your numbers include everything you do with Claude: the app, Cowork, claude.ai, and Claude Code. Limits are per account.
 
 ## Install
 

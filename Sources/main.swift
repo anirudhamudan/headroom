@@ -65,6 +65,7 @@ struct Limit: Identifiable {
 }
 
 enum UsageError: LocalizedError {
+    case cliNotInstalled
     case noCredentials
     case expired
     case rateLimited(retryAfter: TimeInterval)
@@ -73,7 +74,8 @@ enum UsageError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .noCredentials: return "You're not signed in to Claude Code."
+        case .cliNotInstalled: return "Headroom needs the Claude Code command-line tool."
+        case .noCredentials: return "You're not signed in to the Claude Code command-line tool."
         case .expired: return "Your Claude Code sign-in expired."
         case .rateLimited: return "Too many requests right now."
         case .http(let code): return "Couldn't load usage (error \(code))."
@@ -83,7 +85,11 @@ enum UsageError: LocalizedError {
 
     var hint: String? {
         switch self {
-        case .noCredentials: return "Open Terminal, run claude, then type /login."
+        case .cliNotInstalled:
+            return "Claude Code in the Claude app keeps its own sign-in, which Headroom can't read. "
+                + "Copy the install command, paste it into Terminal, then run claude and type /login."
+        case .noCredentials:
+            return "Claude Code in the Claude app doesn't count. In Terminal, run claude, then type /login."
         case .expired:
             return Settings.renewSignIn
                 ? "Headroom couldn't renew it. Open Terminal, run claude, then type /login."
@@ -96,6 +102,51 @@ enum UsageError: LocalizedError {
     var canRetry: Bool {
         if case .rateLimited = self { return false }
         return true
+    }
+
+    /// One-time setup steps and temporary pauses, shown calmly rather than as failures.
+    var isQuiet: Bool {
+        switch self {
+        case .cliNotInstalled, .noCredentials, .rateLimited: return true
+        default: return false
+        }
+    }
+}
+
+// MARK: - Claude Code command-line tool
+
+/// Anthropic's installer for the Claude Code command-line tool.
+let claudeInstallCommand = "curl -fsSL https://claude.ai/install.sh | bash"
+
+/// Whether the `claude` command-line tool is installed. Apps launched from Finder don't get
+/// the shell's PATH, so check the usual install locations, then ask a login shell.
+func isClaudeCLIInstalled() -> Bool {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let candidates = [
+        "\(home)/.local/bin/claude",
+        "\(home)/.claude/local/claude",
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        "\(home)/.npm-global/bin/claude",
+    ]
+    if candidates.contains(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return true }
+
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    p.arguments = ["-lc", "command -v claude"]
+    p.standardOutput = Pipe()
+    p.standardError = Pipe()
+    guard (try? p.run()) != nil else { return false }
+    // A slow shell profile shouldn't hang the refresh.
+    let deadline = Date().addingTimeInterval(3)
+    while p.isRunning && Date() < deadline { usleep(50_000) }
+    if p.isRunning { p.terminate(); return false }
+    return p.terminationStatus == 0
+}
+
+func openTerminal() {
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+        NSWorkspace.shared.openApplication(at: url, configuration: .init())
     }
 }
 
@@ -395,7 +446,11 @@ final class UsageStore: ObservableObject {
             lastUpdated = Date()
         } catch let e as UsageError {
             // Keep the last good numbers on screen; just flag them as stale.
-            error = e
+            if case .noCredentials = e, !isClaudeCLIInstalled() {
+                error = .cliNotInstalled
+            } else {
+                error = e
+            }
             if case .rateLimited(let after) = e {
                 blockedUntil = Date().addingTimeInterval(after)
             }
@@ -572,9 +627,9 @@ struct ContentView: View {
                         detail: [error.hint,
                                  store.lastUpdated.map { "Showing usage from \(clockTime($0))." }]
                             .compactMap { $0 }.joined(separator: " "),
-                        // A temporary rate limit isn't the user's problem to fix; keep it quiet.
-                        fg: error.canRetry ? Palette.dangerText : .secondaryLabelColor,
-                        bg: error.canRetry ? Palette.dangerBg : .quaternaryLabelColor.withAlphaComponent(0.08),
+                        // Setup steps and rate limits aren't failures; keep them calm.
+                        fg: error.isQuiet ? .labelColor : Palette.dangerText,
+                        bg: error.isQuiet ? NSColor.labelColor.withAlphaComponent(0.06) : Palette.dangerBg,
                         action: errorAction(error))
                     .padding(.bottom, 14)
             }
@@ -653,6 +708,17 @@ struct ContentView: View {
 extension ContentView {
     /// An expired sign-in offers to turn on renewal; other errors offer a retry.
     func errorAction(_ error: UsageError) -> (label: String, run: () -> Void)? {
+        switch error {
+        case .cliNotInstalled:
+            return ("Copy command, open Terminal", {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(claudeInstallCommand, forType: .string)
+                openTerminal()
+            })
+        case .noCredentials:
+            return ("Open Terminal", openTerminal)
+        default: break
+        }
         if case .expired = error, !store.renewSignIn {
             return ("Renew automatically", {
                 store.renewSignIn = true
