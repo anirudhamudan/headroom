@@ -8,7 +8,8 @@ Headroom shows your current 5-hour session usage at a glance, and opens a small 
 
 ## How it works
 
-- Reads the sign-in token that [Claude Code](https://docs.claude.com/en/docs/claude-code) stores in your macOS Keychain (`Claude Code-credentials`). It never writes to it or refreshes it.
+- Reads the sign-in token that [Claude Code](https://docs.claude.com/en/docs/claude-code) stores in your macOS Keychain (`Claude Code-credentials`).
+- Claude Code's token expires every few hours and is only renewed while Claude Code is running. **Optional:** turn on *Renew Claude Code sign-in automatically* (gear menu) and Headroom renews it the same way Claude Code does, saving the new token back to the Keychain so Claude Code keeps working. This is off by default because it writes to Claude Code's credentials. In the rare case both apps renew at the same moment, you may need to run `/login` in Claude Code again.
 - Calls the same usage endpoint Claude Code uses for `/usage`. **This endpoint is undocumented** and may change or stop working at any time.
 - Refreshes when you open the panel (at most once a minute) and every 5 minutes, and backs off if the server rate-limits it.
 - Nothing is sent anywhere except Anthropic's API.

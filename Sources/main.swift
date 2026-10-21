@@ -83,7 +83,11 @@ enum UsageError: LocalizedError {
 
     var hint: String? {
         switch self {
-        case .noCredentials, .expired: return "Open Terminal, run claude, then type /login."
+        case .noCredentials: return "Open Terminal, run claude, then type /login."
+        case .expired:
+            return Settings.renewSignIn
+                ? "Headroom couldn't renew it. Open Terminal, run claude, then type /login."
+                : "Headroom can renew it for you, or open Terminal and run claude."
         case .rateLimited(let after): return "Retrying in \(max(1, Int(after / 60))) min."
         default: return nil
         }
@@ -95,35 +99,74 @@ enum UsageError: LocalizedError {
     }
 }
 
+// MARK: - Settings
+
+enum Settings {
+    /// Opt-in: let Headroom renew Claude Code's sign-in when it expires. Off by default
+    /// because it writes to Claude Code's saved credentials, not just reads them.
+    static var renewSignIn: Bool {
+        get { UserDefaults.standard.bool(forKey: "renewSignIn") }
+        set { UserDefaults.standard.set(newValue, forKey: "renewSignIn") }
+    }
+}
+
 // MARK: - Credentials
+
+let keychainService = "Claude Code-credentials"
+let credentialsFile = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".claude/.credentials.json")
+
+// Same values Claude Code uses to renew its own sign-in.
+let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+let claudeCodeClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 struct Credentials {
     let token: String
+    let refreshToken: String?
+    let expiresAt: Date?
     let plan: String?
+    /// The whole stored document, so a renewal can write it back without dropping other keys.
+    let root: [String: Any]
+    let fromKeychain: Bool
+
+    /// Treat tokens about to expire as expired, so a fetch doesn't fail halfway.
+    var isStale: Bool {
+        token.isEmpty || (expiresAt.map { $0.timeIntervalSinceNow < 5 * 60 } ?? false)
+    }
+}
+
+@discardableResult
+func runSecurity(_ args: [String], input: String? = nil) -> (status: Int32, output: Data) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = args
+    let out = Pipe(), inp = Pipe()
+    p.standardOutput = out
+    p.standardError = Pipe()
+    if input != nil { p.standardInput = inp }
+    do { try p.run() } catch { return (-1, Data()) }
+    if let input {
+        inp.fileHandleForWriting.write(Data(input.utf8))
+        try? inp.fileHandleForWriting.close()
+    }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus, data)
 }
 
 /// Reads the OAuth token Claude Code stores. Shells out to `security` because that
 /// binary is already on the keychain item's access list, so no extra prompt appears.
 func loadCredentials() throws -> Credentials {
     var json: Data?
+    var fromKeychain = false
 
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-    let out = Pipe()
-    p.standardOutput = out
-    p.standardError = Pipe()
-    try? p.run()
-    p.waitUntilExit()
-    if p.terminationStatus == 0 {
-        json = out.fileHandleForReading.readDataToEndOfFile()
-    }
-
-    // Fallback used by Claude Code on some setups.
-    if json == nil || json!.isEmpty {
-        let file = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/.credentials.json")
-        json = try? Data(contentsOf: file)
+    let r = runSecurity(["find-generic-password", "-s", keychainService, "-w"])
+    if r.status == 0, !r.output.isEmpty {
+        json = r.output
+        fromKeychain = true
+    } else {
+        // Fallback used by Claude Code on some setups.
+        json = try? Data(contentsOf: credentialsFile)
     }
 
     guard let data = json,
@@ -131,10 +174,79 @@ func loadCredentials() throws -> Credentials {
           let oauth = root["claudeAiOauth"] as? [String: Any]
     else { throw UsageError.noCredentials }
 
-    guard let token = oauth["accessToken"] as? String, !token.isEmpty else {
-        throw UsageError.expired
+    return Credentials(
+        token: oauth["accessToken"] as? String ?? "",
+        refreshToken: (oauth["refreshToken"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+        expiresAt: (oauth["expiresAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) },
+        plan: oauth["subscriptionType"] as? String,
+        root: root,
+        fromKeychain: fromKeychain)
+}
+
+/// Renews the sign-in with its refresh token and saves the result where Claude Code keeps it,
+/// so Claude Code picks up the new token too (refresh tokens are single-use).
+/// `rejectedToken` is a token the API just refused even though it hadn't reached its expiry time.
+func renewCredentials(rejectedToken: String? = nil) async throws -> Credentials {
+    // Re-read first: Claude Code may have renewed it moments ago, and using its
+    // old refresh token would invalidate both.
+    let current = try loadCredentials()
+    if !current.isStale && current.token != rejectedToken { return current }
+    guard let refresh = current.refreshToken else { throw UsageError.expired }
+
+    var req = URLRequest(url: tokenURL)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try JSONSerialization.data(withJSONObject: [
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": claudeCodeClientID,
+    ])
+    req.timeoutInterval = 15
+
+    let data: Data, resp: URLResponse
+    do {
+        (data, resp) = try await URLSession.shared.data(for: req)
+    } catch {
+        throw UsageError.network
     }
-    return Credentials(token: token, plan: oauth["subscriptionType"] as? String)
+    guard (resp as? HTTPURLResponse)?.statusCode == 200,
+          let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let access = body["access_token"] as? String, !access.isEmpty
+    else { throw UsageError.expired }
+
+    var oauth = current.root["claudeAiOauth"] as? [String: Any] ?? [:]
+    oauth["accessToken"] = access
+    if let newRefresh = body["refresh_token"] as? String, !newRefresh.isEmpty {
+        oauth["refreshToken"] = newRefresh
+    }
+    if let expiresIn = (body["expires_in"] as? NSNumber)?.doubleValue {
+        oauth["expiresAt"] = Int64((Date().timeIntervalSince1970 + expiresIn) * 1000)
+    }
+    var root = current.root
+    root["claudeAiOauth"] = oauth
+    let json = try JSONSerialization.data(withJSONObject: root)
+
+    if current.fromKeychain {
+        // Same approach as Claude Code: hex payload over stdin, so the secret never
+        // appears in the process list.
+        let account = keychainAccount() ?? NSUserName()
+        let hex = json.map { String(format: "%02x", $0) }.joined()
+        let cmd = "add-generic-password -U -a \"\(account)\" -s \"\(keychainService)\" -X \"\(hex)\"\n"
+        guard runSecurity(["-i"], input: cmd).status == 0 else { throw UsageError.expired }
+    } else {
+        try json.write(to: credentialsFile, options: .atomic)
+    }
+    return try loadCredentials()
+}
+
+/// The account name on Claude Code's keychain item, so an update replaces it in place.
+func keychainAccount() -> String? {
+    let r = runSecurity(["find-generic-password", "-s", keychainService])
+    guard r.status == 0, let text = String(data: r.output, encoding: .utf8),
+          let line = text.split(separator: "\n").first(where: { $0.contains("\"acct\"") }),
+          let start = line.range(of: "=\""), line.hasSuffix("\"")
+    else { return nil }
+    return String(line[start.upperBound..<line.index(before: line.endIndex)])
 }
 
 // MARK: - API
@@ -236,6 +348,10 @@ final class UsageStore: ObservableObject {
     }
 
     /// `force` (the refresh button) skips the freshness check but still honours rate-limit backoff.
+    @Published var renewSignIn = Settings.renewSignIn {
+        didSet { Settings.renewSignIn = renewSignIn }
+    }
+
     func refresh(force: Bool = false) async {
         guard !loading else { return }
         if let until = blockedUntil, until > Date() { return }
@@ -246,9 +362,19 @@ final class UsageStore: ObservableObject {
         loading = true
         defer { loading = false }
         do {
-            let creds = try loadCredentials()
+            var creds = try loadCredentials()
+            if creds.isStale {
+                guard renewSignIn else { throw UsageError.expired }
+                creds = try await renewCredentials()
+            }
             plan = creds.plan
-            limits = try await fetchLimits(token: creds.token)
+            do {
+                limits = try await fetchLimits(token: creds.token)
+            } catch UsageError.expired where renewSignIn {
+                // Refused before its stated expiry (e.g. revoked); renew once and retry.
+                creds = try await renewCredentials(rejectedToken: creds.token)
+                limits = try await fetchLimits(token: creds.token)
+            }
             error = nil
             blockedUntil = nil
             lastUpdated = Date()
@@ -434,9 +560,7 @@ struct ContentView: View {
                         // A temporary rate limit isn't the user's problem to fix; keep it quiet.
                         fg: error.canRetry ? Palette.dangerText : .secondaryLabelColor,
                         bg: error.canRetry ? Palette.dangerBg : .quaternaryLabelColor.withAlphaComponent(0.08),
-                        action: error.canRetry
-                            ? ("Retry", { Task { await store.refresh(force: true) } })
-                            : nil)
+                        action: errorAction(error))
                     .padding(.bottom, 14)
             }
 
@@ -489,13 +613,18 @@ struct ContentView: View {
                 .help(store.lastUpdated.map { "Updated \(clockTime($0))" } ?? "Refresh")
                 .accessibilityLabel(store.loading ? "Refreshing" : "Refresh")
 
-                Button {
-                    NSApp.terminate(nil)
+                Menu {
+                    Toggle("Renew Claude Code sign-in automatically", isOn: $store.renewSignIn)
+                    Divider()
+                    Button("Quit Headroom") { NSApp.terminate(nil) }
                 } label: {
-                    Image(systemName: "power")
+                    Image(systemName: "gearshape")
                 }
-                .help("Quit")
-                .accessibilityLabel("Quit")
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Settings")
+                .accessibilityLabel("Settings")
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
@@ -503,6 +632,19 @@ struct ContentView: View {
         }
         .padding(16)
         .frame(width: 280)
+    }
+}
+
+extension ContentView {
+    /// An expired sign-in offers to turn on renewal; other errors offer a retry.
+    func errorAction(_ error: UsageError) -> (label: String, run: () -> Void)? {
+        if case .expired = error, !store.renewSignIn {
+            return ("Renew automatically", {
+                store.renewSignIn = true
+                Task { await store.refresh(force: true) }
+            })
+        }
+        return error.canRetry ? ("Retry", { Task { await store.refresh(force: true) } }) : nil
     }
 }
 
