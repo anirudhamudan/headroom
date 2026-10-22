@@ -113,6 +113,47 @@ enum UsageError: LocalizedError {
     }
 }
 
+// MARK: - Certificate guard
+
+/// Refuses connections whose certificate chain includes an eMudhra certificate.
+/// In October 2026 the private keys of eight eMudhra intermediate CAs were found to be
+/// recoverable (https://emudhra.we-have-a-problem.com), so anyone could forge a certificate
+/// for any site. Apple blocks them, but not every Mac has the update yet. Anthropic doesn't
+/// use eMudhra, so rejecting these chains can't break Headroom, and it keeps the Claude
+/// sign-in from being sent to an impersonator.
+final class TrustGuard: NSObject, URLSessionDelegate {
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust
+        else { return completionHandler(.performDefaultHandling, nil) }
+
+        let chain = (SecTrustCopyCertificateChain(trust) as? [SecCertificate]) ?? []
+        if chain.contains(where: isEmudhra) {
+            return completionHandler(.cancelAuthenticationChallenge, nil)
+        }
+        completionHandler(.performDefaultHandling, nil) // normal system checks
+    }
+}
+
+/// Matches the compromised "EM DV/OV/EV TLS CA - G3x" intermediates and anything else
+/// whose subject organisation is eMudhra.
+func isEmudhra(_ cert: SecCertificate) -> Bool {
+    let summary = (SecCertificateCopySubjectSummary(cert) as String?) ?? ""
+    if summary.range(of: #"^EM (DV|OV|EV) TLS CA - G3"#, options: .regularExpression) != nil { return true }
+    let keys = [kSecOIDX509V1SubjectName] as CFArray
+    guard let values = SecCertificateCopyValues(cert, keys, nil) as? [CFString: Any],
+          let subject = values[kSecOIDX509V1SubjectName] as? [CFString: Any],
+          let fields = subject[kSecPropertyKeyValue] as? [[CFString: Any]]
+    else { return false }
+    return fields.contains { field in
+        (field[kSecPropertyKeyLabel] as? String) == (kSecOIDOrganizationName as String)
+            && ((field[kSecPropertyKeyValue] as? String)?.localizedCaseInsensitiveContains("emudhra") ?? false)
+    }
+}
+
+let guardedSession = URLSession(configuration: .default, delegate: TrustGuard(), delegateQueue: nil)
+
 // MARK: - Claude Code command-line tool
 
 /// Anthropic's installer for the Claude Code command-line tool.
@@ -256,7 +297,7 @@ func renewCredentials(rejectedToken: String? = nil) async throws -> Credentials 
 
     let data: Data, resp: URLResponse
     do {
-        (data, resp) = try await URLSession.shared.data(for: req)
+        (data, resp) = try await guardedSession.data(for: req)
     } catch {
         throw UsageError.network
     }
@@ -337,7 +378,7 @@ func fetchLimits(token: String) async throws -> [Limit] {
 
     let data: Data, resp: URLResponse
     do {
-        (data, resp) = try await URLSession.shared.data(for: req)
+        (data, resp) = try await guardedSession.data(for: req)
     } catch {
         throw UsageError.network
     }

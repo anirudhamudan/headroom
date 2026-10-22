@@ -61,6 +61,7 @@ Automatic renewal is off by default because it saves the renewed sign-in back to
 - Calls the same usage endpoint Claude Code uses for `/usage`. **This endpoint is undocumented** and may change or stop working at any time.
 - Refreshes when you open the panel (at most once a minute) and every 5 minutes, and backs off if Anthropic rate-limits it.
 - Talks only to Anthropic. No analytics, no other servers.
+- Refuses any connection whose certificate comes from eMudhra, whose intermediate CA keys were [compromised in October 2026](https://emudhra.we-have-a-problem.com/). That protects your sign-in even on Macs that haven't received Apple's fix yet.
 
 ## Build from source
 
